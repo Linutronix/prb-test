@@ -1,0 +1,52 @@
+John Ogness <john.ogness@linutronix.de>
+
+This is an out-of-tree kernel module to test the lockless printk
+ringbuffer. The kernel module will only work if the lockless printk
+ringbuffer is *not* already part of the kernel.
+
+
+================
+Build the module
+================
+
+If the kernel build directory is /lib/modules/`uname -r`/build
+
+$ make
+
+otherwise
+
+$ BDIR=/kernel/build/dir make
+
+
+==============
+Start the test
+==============
+
+$ sudo insmod ./prb.ko
+
+The machine will have a high load, but should be usable during the test.
+
+
+=============
+Test duration
+=============
+
+A test of at least an hour would be useful. Letting it run longer might
+help to trigger issues. On arm64, I would try to run tests for 30 days.
+
+The system should continue to operate correctly during testing. If at
+any time an OOPS or BUG or WARN is triggered, this information should
+be sent and the ringbuffer has failed!
+
+
+=============
+Stop the test
+=============
+
+$ sudo rmmod prb
+$ sudo dmesg > dmesg.txt
+$ sudo cat /sys/kernel/debug/tracing/trace > trace.txt
+
+Send dmesg.txt and trace.txt to John Ogness <john.ogness@linutronix.de>
+
+Thank you!
