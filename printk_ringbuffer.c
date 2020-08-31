@@ -446,8 +446,16 @@ static enum desc_state desc_read(struct prb_desc_ring *desc_ring,
 	/* Check the descriptor state. */
 	state_val = atomic_long_read(state_var); /* LMM(desc_read:A) */
 	d_state = get_desc_state(id, state_val);
-	if (d_state != desc_committed && d_state != desc_reusable)
+	if (d_state == desc_miss ||
+	    (d_state == desc_reserved && !(state_val & DESC_COMMIT_MASK))) {
+		/*
+		 * The descriptor is in an inconsistent state. Set at least
+		 * @state_var so that the caller can see the details of
+		 * the inconsistent state.
+		 */
+		atomic_long_set(&desc_out->state_var, state_val);
 		return d_state;
+	}
 
 	/*
 	 * Guarantee the state is loaded before copying the descriptor
