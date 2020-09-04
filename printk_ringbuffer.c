@@ -46,22 +46,26 @@
  * into a single descriptor field named @state_var, allowing ID and state to
  * be synchronously and atomically updated.
  *
- * Descriptors have three states:
+ * Descriptors have four states:
  *
  *   reserved
- *     A writer is modifying the record. Internally represented as either "0"
- *     or "DESC_COMMIT_MASK".
+ *     A writer is modifying the record.
  *
  *   committed
- *     The record and all its data are complete and available for reading.
- *     Internally represented as "DESC_COMMIT_MASK | DESC_FINAL_MASK".
+ *     The record and all its data are written. A writer can reopen the
+ *     descriptor (transitioning it back to reserved), but in the committed
+ *     state the data is consistent.
+ *
+ *   finalized
+ *     The record and all its data are complete and available for reading. A
+ *     writer cannot reopen the descriptor.
  *
  *   reusable
  *     The record exists, but its text and/or dictionary data may no longer
- *     be available. Internally represented as "DESC_REUSE_MASK".
+ *     be available.
  *
  * Querying the @state_var of a record requires providing the ID of the
- * descriptor to query. This can yield a possible fourth (pseudo) state:
+ * descriptor to query. This can yield a possible fifth (pseudo) state:
  *
  *   miss
  *     The descriptor being queried has an unexpected ID.
@@ -83,22 +87,25 @@
  *
  * Descriptor Finalization
  * ~~~~~~~~~~~~~~~~~~~~~~~
- * When a writer calls the commit function prb_commit(), the record may still
- * continue to be in the reserved queried state. In order for that record to
- * enter into the committed queried state, that record also must be finalized.
- * A record can be finalized by three different scenarios:
+ * When a writer calls the commit function prb_commit(), record data is
+ * fully stored and is consistent within the ringbuffer. However, a writer can
+ * reopen that record, claiming exclusive access (as with prb_reserve()), and
+ * modify that record. When finished, the writer must again commit the record.
  *
- *   1) A writer can finalize its record immediately by calling
+ * In order for a record to be made available to readers (and also become
+ * recyclable for writers), it must be finalized. A finalized record cannot be
+ * reopened and can never become "unfinalized". Record finalization can occur
+ * in three different scenarios:
+ *
+ *   1) A writer can simultaneously commit and finalize its record by calling
  *      prb_final_commit() instead of prb_commit().
  *
  *   2) When a new record is reserved and the previous record has been
- *      committed via prb_commit(), that previous record is finalized.
+ *      committed via prb_commit(), that previous record is automatically
+ *      finalized.
  *
  *   3) When a record is committed via prb_commit() and a newer record
- *      already exists, the record being committed is finalized.
- *
- * Until a record is finalized (represented by "DESC_FINAL_MASK"), a writer
- * may "reopen" that record and extend it with more data.
+ *      already exists, the record being committed is automatically finalized.
  *
  * Data Rings
  * ~~~~~~~~~~
@@ -118,7 +125,7 @@
  * are met:
  *
  *   1) The descriptor associated with the data block is in the committed
- *      queried state.
+ *      or finalized queried state.
  *
  *   2) The blk_lpos struct within the descriptor associated with the data
  *      block references back to the same data block.
@@ -404,14 +411,6 @@ static bool data_check_size(struct prb_data_ring *data_ring, unsigned int size)
 	return true;
 }
 
-/* The possible responses of a descriptor state-query. */
-enum desc_state {
-	desc_miss,	/* ID mismatch */
-	desc_reserved,	/* reserved, in use by writer */
-	desc_committed, /* committed, writer is done */
-	desc_reusable,	/* free, not yet used by any writer */
-};
-
 /* Query the state of a descriptor. */
 static enum desc_state get_desc_state(unsigned long id,
 				      unsigned long state_val)
@@ -419,21 +418,13 @@ static enum desc_state get_desc_state(unsigned long id,
 	if (id != DESC_ID(state_val))
 		return desc_miss;
 
-	if (state_val & DESC_REUSE_MASK)
-		return desc_reusable;
-
-	if ((state_val & (DESC_COMMIT_MASK | DESC_FINAL_MASK)) ==
-	    (DESC_COMMIT_MASK | DESC_FINAL_MASK)) {
-		return desc_committed;
-	}
-
-	return desc_reserved;
+	return DESC_STATE(state_val);
 }
 
 /*
  * Get a copy of a specified descriptor and its queried state. A descriptor
- * that is not in the committed or reusable state must be considered garbage
- * by the reader.
+ * that is not in the finalized or reusable state must be considered garbage
+ * by readers.
  */
 static enum desc_state desc_read(struct prb_desc_ring *desc_ring,
 				 unsigned long id, struct prb_desc *desc_out)
@@ -446,8 +437,7 @@ static enum desc_state desc_read(struct prb_desc_ring *desc_ring,
 	/* Check the descriptor state. */
 	state_val = atomic_long_read(state_var); /* LMM(desc_read:A) */
 	d_state = get_desc_state(id, state_val);
-	if (d_state == desc_miss ||
-	    (d_state == desc_reserved && !(state_val & DESC_COMMIT_MASK))) {
+	if (d_state == desc_miss || d_state == desc_reserved) {
 		/*
 		 * The descriptor is in an inconsistent state. Set at least
 		 * @state_var so that the caller can see the details of
@@ -527,19 +517,19 @@ static enum desc_state desc_read(struct prb_desc_ring *desc_ring,
 }
 
 /*
- * Take a specified descriptor out of the committed state by attempting
- * the transition from committed to reusable. Either this context or some
+ * Take a specified descriptor out of the finalized state by attempting
+ * the transition from finalized to reusable. Either this context or some
  * other context will have been successful.
  */
 static void desc_make_reusable(struct prb_desc_ring *desc_ring,
 			       unsigned long id)
 {
-	unsigned long val_committed = id | DESC_COMMIT_MASK | DESC_FINAL_MASK;
-	unsigned long val_reusable = id | DESC_REUSE_MASK;
+	unsigned long val_finalized = DESC_SV(id, desc_finalized);
+	unsigned long val_reusable = DESC_SV(id, desc_reusable);
 	struct prb_desc *desc = to_desc(desc_ring, id);
 	atomic_long_t *state_var = &desc->state_var;
 
-	atomic_long_cmpxchg_relaxed(state_var, val_committed,
+	atomic_long_cmpxchg_relaxed(state_var, val_finalized,
 				    val_reusable); /* LMM(desc_make_reusable:A) */
 }
 
@@ -548,7 +538,7 @@ static void desc_make_reusable(struct prb_desc_ring *desc_ring,
  * data block from @lpos_begin until @lpos_end into the reusable state.
  *
  * If there is any problem making the associated descriptor reusable, either
- * the descriptor has not yet been committed or another writer context has
+ * the descriptor has not yet been finalized or another writer context has
  * already pushed the tail lpos past the problematic data block. Regardless,
  * on error the caller can re-load the tail lpos to determine the situation.
  */
@@ -592,10 +582,10 @@ static bool data_make_reusable(struct printk_ringbuffer *rb,
 
 		switch (d_state) {
 		case desc_miss:
-			return false;
 		case desc_reserved:
-			return false;
 		case desc_committed:
+			return false;
+		case desc_finalized:
 			/*
 			 * This data block is invalid if the descriptor
 			 * does not point back to it.
@@ -793,8 +783,9 @@ static bool desc_push_tail(struct printk_ringbuffer *rb,
 		 */
 		return true;
 	case desc_reserved:
-		return false;
 	case desc_committed:
+		return false;
+	case desc_finalized:
 		desc_make_reusable(desc_ring, tail_id);
 		break;
 	case desc_reusable:
@@ -815,7 +806,7 @@ static bool desc_push_tail(struct printk_ringbuffer *rb,
 
 	/*
 	 * Check the next descriptor after @tail_id before pushing the tail
-	 * to it because the tail must always be in a committed or reusable
+	 * to it because the tail must always be in a finalized or reusable
 	 * state. The implementation of prb_first_seq() relies on this.
 	 *
 	 * A successful read implies that the next descriptor is less than or
@@ -824,7 +815,7 @@ static bool desc_push_tail(struct printk_ringbuffer *rb,
 	 */
 	d_state = desc_read(desc_ring, DESC_ID(tail_id + 1), &desc); /* LMM(desc_push_tail:A) */
 
-	if (d_state == desc_committed || d_state == desc_reusable) {
+	if (d_state == desc_finalized || d_state == desc_reusable) {
 		/*
 		 * Guarantee any descriptor states that have transitioned to
 		 * reusable are stored before pushing the tail ID. This allows
@@ -960,7 +951,7 @@ static bool desc_reserve(struct printk_ringbuffer *rb, unsigned long *id_out)
 		 *    with desc_push_tail:C and this also pairs with
 		 *    prb_first_seq:C.
 		 *
-		 * 5. Guarentee the head ID is stored before trying to
+		 * 5. Guarantee the head ID is stored before trying to
 		 *    finalize the previous descriptor. This pairs with
 		 *    _prb_commit:B.
 		 */
@@ -1094,8 +1085,9 @@ static char *data_alloc(struct printk_ringbuffer *rb,
 
 /*
  * Try to resize an existing data block associated with the descriptor
- * specified by @id. If the resized datablock should become wrapped, it
- * copies the old data to the new data block.
+ * specified by @id. If the resized data block should become wrapped, it
+ * copies the old data to the new data block. If @size yields a data block
+ * with the same or less size, the data block is left as is.
  *
  * Fail if this is not the last allocated data block or if there is not
  * enough space or it is not possible make enough space.
@@ -1125,7 +1117,7 @@ static char *data_realloc(struct printk_ringbuffer *rb,
 	next_lpos = get_next_lpos(data_ring, blk_lpos->begin, size);
 
 	/* If the data block does not increase, there is nothing to do. */
-	if (next_lpos == head_lpos) {
+	if ((head_lpos - next_lpos) - 1 < DATA_SIZE(data_ring)) {
 		blk = to_block(data_ring, blk_lpos->begin);
 		return &blk->data[0];
 	}
@@ -1268,19 +1260,16 @@ static struct prb_desc *desc_reopen_last(struct prb_desc_ring *desc_ring,
 	id = atomic_long_read(&desc_ring->head_id);
 
 	/*
-	 * To minimize unnecessarily reopening a descriptor, first check the
-	 * descriptor is in the correct state and has a matching caller ID.
+	 * To reduce unnecessarily reopening, first check if the descriptor
+	 * state and caller ID are correct.
 	 */
 	d_state = desc_read(desc_ring, id, &desc);
-	if (d_state != desc_reserved ||
-	    !(atomic_long_read(&desc.state_var) & DESC_COMMIT_MASK) ||
-	    desc.info.caller_id != caller_id) {
+	if (d_state != desc_committed || desc.info.caller_id != caller_id)
 		return NULL;
-	}
 
 	d = to_desc(desc_ring, id);
 
-	prev_state_val = id | DESC_COMMIT_MASK;
+	prev_state_val = DESC_SV(id, desc_committed);
 
 	/*
 	 * Guarantee the commit flag is removed from the state before
@@ -1300,7 +1289,7 @@ static struct prb_desc *desc_reopen_last(struct prb_desc_ring *desc_ring,
 	 * MB If desc_reopen_last:A to prb_reserve_in_last:A
 	 */
 	if (!atomic_long_try_cmpxchg(&d->state_var, &prev_state_val,
-				     id | 0)) { /* LMM(desc_reopen_last:A) */
+			DESC_SV(id, desc_reserved))) { /* LMM(desc_reopen_last:A) */
 		return NULL;
 	}
 
@@ -1321,9 +1310,9 @@ static struct prb_desc *desc_reopen_last(struct prb_desc_ring *desc_ring,
  * data.
  *
  * The writer specifies the text size to extend (not the new total size) by
- * setting the @text_buf_size field of @r. Dictionaries cannot be extended so
- * @dict_buf_size of @r should be set to 0. To ensure proper initialization of
- * @r, prb_rec_init_wr() should be used.
+ * setting the @text_buf_size field of @r. Extending dictionaries is not
+ * supported, so @dict_buf_size of @r should be set to 0. To ensure proper
+ * initialization of @r, prb_rec_init_wr() should be used.
  *
  * This function will fail if @caller_id does not match the caller ID of the
  * newest record. In that case the caller must reserve new data using
@@ -1336,9 +1325,9 @@ static struct prb_desc *desc_reopen_last(struct prb_desc_ring *desc_ring,
  *
  *   - @r->text_buf points to the beginning of the entire text buffer.
  *
- *   - @r->text_buf_len is set to the new total size of the buffer.
+ *   - @r->text_buf_size is set to the new total size of the buffer.
  *
- *   - @r->dict_buf and @r->dict_buf_len are cleared because extending
+ *   - @r->dict_buf and @r->dict_buf_size are cleared because extending
  *     the dict buffer is not supported.
  *
  *   - @r->info is not touched so that @r->info->text_len could be used
@@ -1379,15 +1368,22 @@ bool prb_reserve_in_last(struct prb_reserved_entry *e, struct printk_ringbuffer 
 	e->rb = rb;
 	e->id = id;
 
-	if (WARN_ON_ONCE(caller_id != d->info.caller_id)) {
-		pr_warn_once("wrong caller id (%u, expecting %u)\n",
-			     d->info.caller_id, caller_id);
+	/*
+	 * desc_reopen_last() checked the caller_id, but there was no
+	 * exclusive access at that point. The descriptor may have
+	 * changed since then.
+	 */
+	if (caller_id != d->info.caller_id)
 		goto fail;
-	}
 
 	if (BLK_DATALESS(&d->text_blk_lpos)) {
 		r->text_buf = data_alloc(rb, &rb->text_data_ring, r->text_buf_size,
 					 &d->text_blk_lpos, id);
+		if (WARN_ON_ONCE(d->info.text_len != 0)) {
+			pr_warn_once("wrong text_len value (%u, expecting 0)\n",
+				     d->info.text_len);
+			d->info.text_len = data_size;
+		}
 	} else {
 		if (!get_data(&rb->text_data_ring, &d->text_blk_lpos, &data_size))
 			goto fail;
@@ -1398,8 +1394,8 @@ bool prb_reserve_in_last(struct prb_reserved_entry *e, struct printk_ringbuffer 
 		 * block size.
 		 */
 		if (WARN_ON_ONCE(d->info.text_len > data_size)) {
-			pr_warn_once("wrong data size (%u, expecting >=%hu) for data\n",
-				     data_size, d->info.text_len);
+			pr_warn_once("wrong text_len value (%u, expecting <=%hu)\n",
+				     d->info.text_len, data_size);
 			d->info.text_len = data_size;
 		}
 		r->text_buf_size += d->info.text_len;
@@ -1437,11 +1433,11 @@ fail_reopen:
  */
 static void desc_make_final(struct prb_desc_ring *desc_ring, unsigned long id)
 {
-	unsigned long prev_state_val = id | DESC_COMMIT_MASK;
+	unsigned long prev_state_val = DESC_SV(id, desc_committed);
 	struct prb_desc *d = to_desc(desc_ring, id);
 
 	atomic_long_cmpxchg_relaxed(&d->state_var, prev_state_val,
-			prev_state_val | DESC_FINAL_MASK); /* LMM(desc_make_final:A) */
+			DESC_SV(id, desc_finalized)); /* LMM(desc_make_final:A) */
 }
 
 /**
@@ -1481,6 +1477,7 @@ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
 	struct prb_desc_ring *desc_ring = &rb->desc_ring;
 	struct prb_desc *d;
 	unsigned long id;
+	u64 seq;
 
 	if (!data_check_size(&rb->text_data_ring, r->text_buf_size))
 		goto fail;
@@ -1506,16 +1503,12 @@ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
 	d = to_desc(desc_ring, id);
 
 	/*
-	 * Clear all @info fields except for @seq, which is used to determine
-	 * the new sequence number. The writer must fill in new values.
+	 * All @info fields (except @seq) are cleared and must be filled in by
+	 * the writer. Save @seq before clearing because it is used to
+	 * determine the new sequence number.
 	 */
-	d->info.ts_nsec = 0;
-	d->info.text_len = 0;
-	d->info.dict_len = 0;
-	d->info.facility = 0;
-	d->info.flags = 0;
-	d->info.level = 0;
-	d->info.caller_id = 0;
+	seq = d->info.seq;
+	memset(&d->info, 0, sizeof(d->info));
 
 	/*
 	 * Set the @e fields here so that prb_commit() can be used if
@@ -1535,10 +1528,10 @@ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
 	 * See the "Bootstrap" comment block in printk_ringbuffer.h for
 	 * details about how the initializer bootstraps the descriptors.
 	 */
-	if (d->info.seq == 0 && DESC_INDEX(desc_ring, id) != 0)
+	if (seq == 0 && DESC_INDEX(desc_ring, id) != 0)
 		d->info.seq = DESC_INDEX(desc_ring, id);
 	else
-		d->info.seq += DESCS_COUNT(desc_ring);
+		d->info.seq = seq + DESCS_COUNT(desc_ring);
 
 	/*
 	 * New data is about to be reserved. Once that happens, previous
@@ -1580,11 +1573,11 @@ fail:
 }
 
 /* Commit the data (possibly finalizing it) and restore interrupts. */
-static void _prb_commit(struct prb_reserved_entry *e, unsigned long final_mask)
+static void _prb_commit(struct prb_reserved_entry *e, unsigned long state_val)
 {
 	struct prb_desc_ring *desc_ring = &e->rb->desc_ring;
 	struct prb_desc *d = to_desc(desc_ring, e->id);
-	unsigned long prev_state_val = e->id | 0;
+	unsigned long prev_state_val = DESC_SV(e->id, desc_reserved);
 
 	/* Now the writer has finished all writing: LMM(_prb_commit:A) */
 
@@ -1612,8 +1605,7 @@ static void _prb_commit(struct prb_reserved_entry *e, unsigned long final_mask)
 	 *    MB desc_reserve:D to desc_make_final:A
 	 */
 	if (!atomic_long_try_cmpxchg(&d->state_var, &prev_state_val,
-				     e->id | DESC_COMMIT_MASK |
-					     final_mask)) { /* LMM(_prb_commit:B) */
+			DESC_SV(e->id, state_val))) { /* LMM(_prb_commit:B) */
 		WARN_ON_ONCE(1);
 	}
 
@@ -1642,7 +1634,7 @@ void prb_commit(struct prb_reserved_entry *e)
 	struct prb_desc_ring *desc_ring = &e->rb->desc_ring;
 	unsigned long head_id;
 
-	_prb_commit(e, 0);
+	_prb_commit(e, desc_committed);
 
 	/*
 	 * If this descriptor is no longer the head (i.e. a new record has
@@ -1671,7 +1663,7 @@ void prb_commit(struct prb_reserved_entry *e)
  */
 void prb_final_commit(struct prb_reserved_entry *e)
 {
-	_prb_commit(e, DESC_FINAL_MASK);
+	_prb_commit(e, desc_finalized);
 }
 
 /*
@@ -1746,16 +1738,16 @@ static bool copy_data(struct prb_data_ring *data_ring,
 
 /*
  * This is an extended version of desc_read(). It gets a copy of a specified
- * descriptor. However, it also verifies that the record is committed and has
+ * descriptor. However, it also verifies that the record is finaized and has
  * the sequence number @seq. On success, 0 is returned.
  *
  * Error return values:
- * -EINVAL: A committed record with sequence number @seq does not exist.
- * -ENOENT: A committed record with sequence number @seq exists, but its data
+ * -EINVAL: A finalized record with sequence number @seq does not exist.
+ * -ENOENT: A finalized record with sequence number @seq exists, but its data
  *          is not available. This is a valid record, so readers should
  *          continue with the next record.
  */
-static int desc_read_committed_seq(struct prb_desc_ring *desc_ring,
+static int desc_read_finalized_seq(struct prb_desc_ring *desc_ring,
 				   unsigned long id, u64 seq,
 				   struct prb_desc *desc_out)
 {
@@ -1766,11 +1758,12 @@ static int desc_read_committed_seq(struct prb_desc_ring *desc_ring,
 
 	/*
 	 * An unexpected @id (desc_miss) or @seq mismatch means the record
-	 * does not exist. A descriptor in the reserved state means the
-	 * record does not yet exist for the reader.
+	 * does not exist. A descriptor in the reserved or committed state
+	 * means the record does not yet exist for the reader.
 	 */
 	if (d_state == desc_miss ||
 	    d_state == desc_reserved ||
+	    d_state == desc_committed ||
 	    desc_out->info.seq != seq) {
 		return -EINVAL;
 	}
@@ -1792,7 +1785,7 @@ static int desc_read_committed_seq(struct prb_desc_ring *desc_ring,
  * Copy the ringbuffer data from the record with @seq to the provided
  * @r buffer. On success, 0 is returned.
  *
- * See desc_read_committed_seq() for error return values.
+ * See desc_read_finalized_seq() for error return values.
  */
 static int prb_read(struct printk_ringbuffer *rb, u64 seq,
 		    struct printk_record *r, unsigned int *line_count)
@@ -1808,7 +1801,7 @@ static int prb_read(struct printk_ringbuffer *rb, u64 seq,
 	id = DESC_ID(atomic_long_read(state_var));
 
 	/* Get a local copy of the correct descriptor (if available). */
-	err = desc_read_committed_seq(desc_ring, id, seq, &desc);
+	err = desc_read_finalized_seq(desc_ring, id, seq, &desc);
 
 	/*
 	 * If @r is NULL, the caller is only interested in the availability
@@ -1838,8 +1831,8 @@ static int prb_read(struct printk_ringbuffer *rb, u64 seq,
 			r->info->dict_len = 0;
 	}
 
-	/* Ensure the record is still committed and has the same @seq. */
-	return desc_read_committed_seq(desc_ring, id, seq, &desc);
+	/* Ensure the record is still finalized and has the same @seq. */
+	return desc_read_finalized_seq(desc_ring, id, seq, &desc);
 }
 
 /* Get the sequence number of the tail descriptor. */
@@ -1857,9 +1850,9 @@ static u64 prb_first_seq(struct printk_ringbuffer *rb)
 
 		/*
 		 * This loop will not be infinite because the tail is
-		 * _always_ in the committed or reusable state.
+		 * _always_ in the finalized or reusable state.
 		 */
-		if (d_state == desc_committed || d_state == desc_reusable)
+		if (d_state == desc_finalized || d_state == desc_reusable)
 			break;
 
 		/*
@@ -1886,8 +1879,8 @@ static u64 prb_first_seq(struct printk_ringbuffer *rb)
 }
 
 /*
- * Non-blocking read of a record. Updates @seq to the last committed record
- * (which may have no data).
+ * Non-blocking read of a record. Updates @seq to the last finalized record
+ * (which may have no data available).
  *
  * See the description of prb_read_valid() and prb_read_valid_info()
  * for details.
@@ -1913,7 +1906,7 @@ static bool _prb_read_valid(struct printk_ringbuffer *rb, u64 *seq,
 			(*seq)++;
 
 		} else {
-			/* Non-existent/non-committed record. Must stop. */
+			/* Non-existent/non-finalized record. Must stop. */
 			return false;
 		}
 	}
