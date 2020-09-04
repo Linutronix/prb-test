@@ -42,16 +42,17 @@ static char *test_running;
 static int halt_test;
 
 /* dump text or dictionary data to the trace buffers */
-static void print_record(const char *name, struct rbdata *dat, u64 seq)
+static void print_record(const char *name, struct rbdata *dat, u64 seq, size_t text_len)
 {
 	char buf[160];
 
 	snprintf(buf, sizeof(buf), "%s", dat->text);
 	buf[sizeof(buf) - 1] = 0;
 
-	trace_printk("seq=%llu len=%d %sval=%s\n",
-		     seq, dat->len, name,
-		     dat->len < sizeof(buf) ? buf : "<invalid>");
+	trace_printk("seq=%llu len=%d %s%sval=%s\n",
+		     seq, dat->len,
+		     text_len > dat->len + sizeof(struct rbdata) + 1 ? "EXT " : "",
+		     name, dat->len < sizeof(buf) ? buf : "<invalid>");
 }
 
 static bool check_data(struct rbdata *dat, u64 seq, unsigned long num)
@@ -168,10 +169,11 @@ static void dump_rb(struct printk_ringbuffer *rb)
 			trace_printk("*** BAD ***\n");
 
 		print_record("TEXT", (struct rbdata *)&r.text_buf[0],
-			     info.seq);
+			     info.seq, info.text_len);
+
 		if (info.dict_len) {
 			print_record("DICT", (struct rbdata *)&r.dict_buf[0],
-				     info.seq);
+				     info.seq, info.dict_len);
 		}
 
 		seq = info.seq + 1;
