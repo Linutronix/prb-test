@@ -990,7 +990,7 @@ static bool desc_reserve(struct printk_ringbuffer *rb, unsigned long *id_out)
 	 * This pairs with desc_read:D.
 	 */
 	if (!atomic_long_try_cmpxchg(&desc->state_var, &prev_state_val,
-				     id | 0)) { /* LMM(desc_reserve:F) */
+			DESC_SV(id, desc_reserved))) { /* LMM(desc_reserve:F) */
 		WARN_ON_ONCE(1);
 		return false;
 	}
