@@ -1127,7 +1127,7 @@ static char *data_realloc(struct printk_ringbuffer *rb,
 	next_lpos = get_next_lpos(data_ring, blk_lpos->begin, size);
 
 	/* If the data block does not increase, there is nothing to do. */
-	if ((head_lpos - next_lpos) - 1 < DATA_SIZE(data_ring)) {
+	if (head_lpos - next_lpos < DATA_SIZE(data_ring)) {
 		blk = to_block(data_ring, blk_lpos->begin);
 		return &blk->data[0];
 	}
