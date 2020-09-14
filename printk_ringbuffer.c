@@ -1387,13 +1387,17 @@ bool prb_reserve_in_last(struct prb_reserved_entry *e, struct printk_ringbuffer 
 		goto fail;
 
 	if (BLK_DATALESS(&d->text_blk_lpos)) {
+		if (WARN_ON_ONCE(d->info.text_len != 0)) {
+			pr_warn_once("wrong text_len value (%hu, expecting 0)\n",
+				     d->info.text_len);
+			d->info.text_len = 0;
+		}
+
+		if (!data_check_size(&rb->text_data_ring, r->text_buf_size))
+			goto fail;
+
 		r->text_buf = data_alloc(rb, &rb->text_data_ring, r->text_buf_size,
 					 &d->text_blk_lpos, id);
-		if (WARN_ON_ONCE(d->info.text_len != 0)) {
-			pr_warn_once("wrong text_len value (%u, expecting 0)\n",
-				     d->info.text_len);
-			d->info.text_len = data_size;
-		}
 	} else {
 		if (!get_data(&rb->text_data_ring, &d->text_blk_lpos, &data_size))
 			goto fail;
@@ -1404,7 +1408,7 @@ bool prb_reserve_in_last(struct prb_reserved_entry *e, struct printk_ringbuffer 
 		 * block size.
 		 */
 		if (WARN_ON_ONCE(d->info.text_len > data_size)) {
-			pr_warn_once("wrong text_len value (%u, expecting <=%hu)\n",
+			pr_warn_once("wrong text_len value (%hu, expecting <=%u)\n",
 				     d->info.text_len, data_size);
 			d->info.text_len = data_size;
 		}
