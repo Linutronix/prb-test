@@ -300,13 +300,13 @@
  *     push data tail (lpos), then modify new data block area
  *
  *   _prb_commit:B / desc_read:B
- *     store writer changes, then set new descriptor commit flag (state)
+ *     store writer changes, then set new descriptor committed (state)
  *
  *   desc_reopen_last:A / _prb_commit:B
- *     store removed descriptor commit flag (state), then read descriptor data
+ *     set descriptor reserved (state), then read descriptor data
  *
  *   _prb_commit:B / desc_reserve:D
- *     set new descriptor commit flag (state), then check descriptor head (id)
+ *     set new descriptor committed (state), then check descriptor head (id)
  *
  *   data_push_tail:D / data_push_tail:A
  *     set descriptor reusable (state), then push data tail (lpos)
@@ -1252,11 +1252,9 @@ static const char *get_data(struct prb_data_ring *data_ring,
 }
 
 /*
- * Attempt to remove the commit flag so that the record can be modified by a
- * writer again. This is only possible if the descriptor is not yet finalized.
- *
- * Note that on success, the queried state did not change. A non-finalized
- * record (even with the commit flag set) is in the reserved queried state.
+ * Attempt to transition the newest descriptor from committed back to reserved
+ * so that the record can be modified by a writer again. This is only possible
+ * if the descriptor is not yet finalized and the provided @caller_id matches.
  */
 static struct prb_desc *desc_reopen_last(struct prb_desc_ring *desc_ring,
 					 u32 caller_id, unsigned long *id_out)
@@ -1282,10 +1280,9 @@ static struct prb_desc *desc_reopen_last(struct prb_desc_ring *desc_ring,
 	prev_state_val = DESC_SV(id, desc_committed);
 
 	/*
-	 * Guarantee the commit flag is removed from the state before
-	 * reading any record data. A full memory barrier is needed
-	 * because @state_var is modified for the read. This pairs with
-	 * _prb_commit:B.
+	 * Guarantee the reserved state is stored before reading any
+	 * record data. A full memory barrier is needed because @state_var
+	 * modification is followed by reading. This pairs with _prb_commit:B.
 	 *
 	 * Memory barrier involvement:
 	 *
@@ -1517,8 +1514,8 @@ bool prb_reserve(struct prb_reserved_entry *e, struct printk_ringbuffer *rb,
 	d = to_desc(desc_ring, id);
 
 	/*
-	 * All @info fields (except @seq) are cleared and must be filled in by
-	 * the writer. Save @seq before clearing because it is used to
+	 * All @info fields (except @seq) are cleared and must be filled in
+	 * by the writer. Save @seq before clearing because it is used to
 	 * determine the new sequence number.
 	 */
 	seq = d->info.seq;
@@ -1603,9 +1600,9 @@ static void _prb_commit(struct prb_reserved_entry *e, unsigned long state_val)
 	 *    is stored as committed. A write memory barrier is sufficient
 	 *    for this. This pairs with desc_read:B and desc_reopen_last:A.
 	 *
-	 * 2. Guarantee the commit flag is stored before re-checking the
-	 *    head ID in order to possibly finalize this descriptor. This
-	 *    pairs with desc_reserve:D.
+	 * 2. Guarantee the descriptor state is stored as committed before
+	 *    re-checking the head ID in order to possibly finalize this
+	 *    descriptor. This pairs with desc_reserve:D.
 	 *
 	 *    Memory barrier involvement:
 	 *
@@ -1752,7 +1749,7 @@ static bool copy_data(struct prb_data_ring *data_ring,
 
 /*
  * This is an extended version of desc_read(). It gets a copy of a specified
- * descriptor. However, it also verifies that the record is finaized and has
+ * descriptor. However, it also verifies that the record is finalized and has
  * the sequence number @seq. On success, 0 is returned.
  *
  * Error return values:
