@@ -11,22 +11,17 @@
 #include "printk_ringbuffer.h"
 
 /*
- * This is a test module that starts "num_online_cpus()" writer threads
+ * This is a test module that starts "num_online_cpus()-1" writer threads
  * that each write data of varying length. They do this as fast as
- * they can.
- *
- * Dictionary data is stored in a separate data ring. The writers will
- * only write dictionary data about half the time. This is to make the
- * test more realistic with text and dict data rings containing
- * different data blocks.
+ * they can. There is also 1 reader thread reading as fast as it can.
  *
  * Because the threads are running in such tight loops, they will call
  * schedule() from time to time so the system stays alive.
  *
- * If the writers encounter an error, the test is aborted. Test results are
- * recorded to the ftrace buffers, with some additional information also
- * provided via printk. The test can be aborted manually by removing the
- * module. (Ideally the test should never abort on its own.)
+ * If the writers or reader encounter an error, the test is aborted. Test
+ * results are recorded to the ftrace buffers, with some additional
+ * information also provided via printk. The test can be aborted manually
+ * by removing the module. (Ideally the test should never abort on its own.)
  */
 
 /* used by writers to signal reader of new records */
@@ -41,7 +36,7 @@ struct rbdata {
 static char *test_running;
 static int halt_test;
 
-/* dump text or dictionary data to the trace buffers */
+/* dump text data to the trace buffers */
 static void print_record(const char *name, struct rbdata *dat, u64 seq, size_t text_len)
 {
 	char buf[160];
@@ -152,11 +147,9 @@ static void dump_rb(struct printk_ringbuffer *rb)
 	struct printk_info info;
 	struct printk_record r;
 	char text_buf[200];
-	char dict_buf[200];
 	u64 seq = 0;
 
-	prb_rec_init_rd(&r, &info, &text_buf[0], sizeof(text_buf),
-			&dict_buf[0], sizeof(dict_buf));
+	prb_rec_init_rd(&r, &info, &text_buf[0], sizeof(text_buf));
 
 	trace_printk("BEGIN full dump\n");
 
@@ -171,11 +164,6 @@ static void dump_rb(struct printk_ringbuffer *rb)
 		print_record("TEXT", (struct rbdata *)&r.text_buf[0],
 			     info.seq, info.text_len);
 
-		if (info.dict_len) {
-			print_record("DICT", (struct rbdata *)&r.dict_buf[0],
-				     info.seq, info.dict_len);
-		}
-
 		seq = info.seq + 1;
 	}
 
@@ -184,14 +172,13 @@ static void dump_rb(struct printk_ringbuffer *rb)
 	raw_dump(rb);
 }
 
-DEFINE_PRINTKRB(test_rb, 10, 5, 5);
+DEFINE_PRINTKRB(test_rb, 10, 5);
 
 static int prbtest_writer(void *data)
 {
 	unsigned long num = (unsigned long)data;
 	struct prb_reserved_entry e;
 	char text_id = 'A' + num;
-	char dict_id = 'a' + num;
 	unsigned long count = 0;
 	struct printk_record r;
 	u64 min_ns = (u64)-1;
@@ -210,12 +197,8 @@ static int prbtest_writer(void *data)
 	for (;;) {
 		len = sizeof(struct rbdata) + (prandom_u32() & 0x7f) + 2;
 
-		/* specify the text/dict sizes for reservation */
-		/* only add a dictionary on some records */
-		if (len % 2)
-			prb_rec_init_wr(&r, len, len);
-		else
-			prb_rec_init_wr(&r, len, 0);
+		/* specify the text size for reservation */
+		prb_rec_init_wr(&r, len);
 
 		pre_ns = local_clock();
 
@@ -225,20 +208,6 @@ static int prbtest_writer(void *data)
 			memset(&dat->text[0], text_id, dat->len);
 			dat->text[dat->len] = 0;
 			r.info->text_len = len;
-
-			/* dictionary reservation is allowed to fail */
-			if (r.dict_buf) {
-				dat = (struct rbdata *)&r.dict_buf[0];
-				dat->len = len - sizeof(struct rbdata) - 1;
-				memset(&dat->text[0], dict_id, dat->len);
-				dat->text[dat->len] = 0;
-				r.info->dict_len = len;
-			} else if (r.text_buf_size % 2) {
-				trace_printk(
-				    "writer%lu (%c) dict dropped: seq=%llu\n",
-				    num, text_id, r.info->seq);
-			}
-
 			r.info->caller_id = num + 1048576;
 			seq = r.info->seq;
 
@@ -247,7 +216,7 @@ static int prbtest_writer(void *data)
 			post_ns = local_clock();
 
 			/* append another struct */
-			prb_rec_init_wr(&r, len, 0);
+			prb_rec_init_wr(&r, len);
 			if (prb_reserve_in_last(&e, &test_rb, &r, num + 1048576)) {
 				if (r.info->seq != seq) {
 					trace_printk("writer%lu (%c) unexpected seq: %llu != %llu\n",
@@ -303,14 +272,12 @@ static int prbtest_reader(void *data)
 	struct printk_record r;
 	struct rbdata *dat;
 	char text_buf[400];
-	char dict_buf[400];
 	int did_sched = 1;
 	u64 seq = 0;
 
 	set_cpus_allowed_ptr(current, cpumask_of(num));
 
-	prb_rec_init_rd(&r, &info, &text_buf[0], sizeof(text_buf),
-			&dict_buf[0], sizeof(dict_buf));
+	prb_rec_init_rd(&r, &info, &text_buf[0], sizeof(text_buf));
 
 	pr_err("prbtest: start thread %03lu (reader)\n", num);
 
@@ -338,18 +305,6 @@ static int prbtest_reader(void *data)
 			dat = (struct rbdata *)&r.text_buf[dat->len + sizeof(struct rbdata) + 1];
 			if (!check_data(dat, info.seq, num))
 				trace_printk("text extension error\n");
-
-			if (info.dict_len) {
-				dat = (struct rbdata *)&r.dict_buf[0];
-				if (!check_data(dat, info.seq, num))
-					trace_printk("dict extension error\n");
-			}
-		} else if (info.dict_len) {
-			dat = (struct rbdata *)&r.dict_buf[0];
-			if (!check_data(dat, info.seq, num))
-				trace_printk("dict error\n");
-		} else if (info.text_len % 2) {
-			trace_printk("dict dropped: seq=%llu\n", info.seq);
 		}
 
 		did_sched = 0;
